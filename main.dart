@@ -16,6 +16,7 @@
 // - Full UI updated to read/write with Supabase
 // -----------------------------------------------------------------------------
 
+import 'onboarding.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
@@ -37,6 +38,7 @@ const String kSupabaseAnonKey = String.fromEnvironment(
 );
 
 // ใช้ dart-define แทน (ค่า default เว้นว่าง)
+// ใส่ API Key ของคุณตรงนี้
 const String kOpenAIKey =
     String.fromEnvironment('OPENAI_API_KEY', defaultValue: '');
 const String kOpenAIModel = String.fromEnvironment(
@@ -149,17 +151,48 @@ class ChatThread {
       );
 }
 
+class DailyQuestionService {
+  static const String _key = "last_question_date";
+
+  /// เช็คว่าวันนี้ยังไม่ได้ถาม -> true = ควรถาม
+  static Future<bool> shouldAskToday() async {
+    final prefs = await SharedPreferences.getInstance();
+    final today = DateTime.now();
+    final todayStr = "${today.year}-${today.month}-${today.day}";
+
+    final last = prefs.getString(_key);
+
+    if (last == todayStr) {
+      return false; // วันนี้ถามไปแล้ว
+    }
+
+    return true; // ยังไม่ได้ถาม
+  }
+
+  /// บันทึกว่าวันนี้ถามแล้ว
+  static Future<void> markAsked() async {
+    final prefs = await SharedPreferences.getInstance();
+    final today = DateTime.now();
+    final todayStr = "${today.year}-${today.month}-${today.day}";
+    await prefs.setString(_key, todayStr);
+  }
+}
+
 // -----------------------------------------------------------------------------
 // Local Storage (SharedPreferences JSON) — used BEFORE login & for migration
 // -----------------------------------------------------------------------------
 class AppStorage {
   static SharedPreferences? _prefs;
 
-  // ==== Keys ====
+  // ==== Keys (เดิม) ====
   static const _kThreadsKey = 'here_me_threads_v2';
   static const _kProfileKey = 'here_me_profile_v1';
   static const _kMoodKey = 'here_me_mood_v1';
   static const _kMoodHistoryKey = 'here_me_mood_history_v1';
+
+  // ==== Keys (ใหม่: Onboarding & Language) ====
+  static const _kOnboardingSeen = 'here_me_onboarding_seen_v1';
+  static const _kAppLanguage = 'here_me_language_v1'; // 'th' | 'en'
 
   // ==== Init ====
   static Future<void> init() async {
@@ -170,7 +203,9 @@ class AppStorage {
     if (_prefs == null) await init();
   }
 
-  // ==== Threads ====
+  // ---------------------------------------------------------------------------
+  // Threads (Local JSON)
+  // ---------------------------------------------------------------------------
   static Future<List<ChatThread>> loadThreads() async {
     await _ensure();
     final raw = _prefs!.getString(_kThreadsKey);
@@ -191,7 +226,9 @@ class AppStorage {
     await _prefs!.setString(_kThreadsKey, raw);
   }
 
-  // ==== Profile ====
+  // ---------------------------------------------------------------------------
+  // Profile (Local JSON)
+  // ---------------------------------------------------------------------------
   static Future<void> saveProfile(Map<String, String?> profile) async {
     await _ensure();
     await _prefs!.setString(_kProfileKey, jsonEncode(profile));
@@ -209,7 +246,9 @@ class AppStorage {
     }
   }
 
-  // ==== Mood (latest-of-day, compatibility) ====
+  // ---------------------------------------------------------------------------
+  // Mood (latest-of-day, compatibility)
+  // ---------------------------------------------------------------------------
   static Future<void> saveMood(int mood, List<String> symptoms) async {
     await _ensure();
     final obj = {'mood': mood, 'symptoms': symptoms};
@@ -232,7 +271,9 @@ class AppStorage {
     }
   }
 
-  // ==== Mood History (multi-day) ====
+  // ---------------------------------------------------------------------------
+  // Mood History (multi-day)
+  // ---------------------------------------------------------------------------
   static Future<List<MoodEntry>> loadMoodHistory() async {
     await _ensure();
     final raw = _prefs!.getString(_kMoodHistoryKey);
@@ -253,13 +294,40 @@ class AppStorage {
     await _prefs!.setString(_kMoodHistoryKey, raw);
   }
 
-  // ==== Utilities ====
+  // ---------------------------------------------------------------------------
+  // Onboarding & Language (ใหม่)
+  // ---------------------------------------------------------------------------
+  static Future<bool> loadOnboardingSeen() async {
+    await _ensure();
+    return _prefs!.getBool(_kOnboardingSeen) ?? false;
+  }
+
+  static Future<void> saveOnboardingSeen(bool v) async {
+    await _ensure();
+    await _prefs!.setBool(_kOnboardingSeen, v);
+  }
+
+  static Future<String?> loadAppLanguage() async {
+    await _ensure();
+    return _prefs!.getString(_kAppLanguage);
+  }
+
+  static Future<void> saveAppLanguage(String lang) async {
+    await _ensure();
+    await _prefs!.setString(_kAppLanguage, lang);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Utilities
+  // ---------------------------------------------------------------------------
   static Future<void> clearAll() async {
     await _ensure();
     await _prefs!.remove(_kThreadsKey);
     await _prefs!.remove(_kProfileKey);
     await _prefs!.remove(_kMoodKey);
     await _prefs!.remove(_kMoodHistoryKey);
+    await _prefs!.remove(_kOnboardingSeen);
+    await _prefs!.remove(_kAppLanguage);
   }
 }
 
@@ -285,22 +353,27 @@ class AuthService {
   static String? get uid => supabase.auth.currentUser?.id;
 
   // ===== Email =====
-  static Future<sb.AuthResponse> signUpEmail(
-      String email, String password) async {
-    return supabase.auth.signUp(
+  // ===== Email OTP =====
+  static Future<void> sendOtpToEmail(String email,
+      {bool shouldCreateUser = true}) async {
+    await supabase.auth.signInWithOtp(
       email: email,
-      password: password,
-      emailRedirectTo: 'hereme://login-callback',
+      shouldCreateUser: true, // สมัครใหม่ถ้าไม่มี
     );
   }
 
-  static Future<sb.AuthResponse> signInEmail(
-      String email, String password) async {
-    return supabase.auth.signInWithPassword(email: email, password: password);
+  static Future<void> verifyEmailOtp({
+    required String email,
+    required String code6,
+  }) async {
+    await supabase.auth.verifyOTP(
+      email: email,
+      token: code6,
+      type: sb.OtpType.email, // <<< สำคัญ ตรงนี้บอกว่าเป็น email OTP
+    );
   }
 
-  // ===== Phone + Password (สมัครครั้งแรกต้องยืนยัน OTP) =====
-  // สมัครด้วย "เบอร์+รหัส" → ถ้ามี user เดิมอยู่แล้ว จะไม่พัง แต่จะส่ง OTP ให้ยืนยันแทน
+  // สมัครด้วย "เบอร์ + รหัส" แล้วส่ง OTP ไปยืนยันเบอร์
   static Future<void> startPhonePassSignup({
     required String phoneRaw,
     required String password,
@@ -311,7 +384,7 @@ class AuthService {
       // พยายามสร้าง user ใหม่พร้อม password
       await supabase.auth.signUp(phone: phone, password: password);
     } on sb.AuthException catch (e) {
-      // ถ้าเป็นเคสผู้ใช้มีอยู่แล้ว ให้ผ่านไปขั้นตอนส่ง OTP ได้เลย
+      // ถ้าเป็นเคสผู้ใช้มีอยู่แล้ว ให้ปล่อยผ่าน แล้วไปขั้นตอนส่ง OTP ต่อ
       final msg = e.message.toLowerCase();
       final already = msg.contains('already') ||
           msg.contains('registered') ||
@@ -1033,87 +1106,64 @@ class _HereMeAppState extends State<HereMeApp> {
 // -----------------------------------------------------------------------------
 // Splash (in-app) — โลโก้ย่ออัตโนมัติให้ไม่ใหญ่เกินไป
 class _Boot extends StatefulWidget {
-  const _Boot();
+  const _Boot({super.key});
   @override
   State<_Boot> createState() => _BootState();
 }
 
-class _BootState extends State<_Boot> with SingleTickerProviderStateMixin {
-  late final AnimationController _ac = AnimationController(
-      vsync: this, duration: const Duration(milliseconds: 600))
-    ..forward();
-  late final Animation<double> _fade =
-      CurvedAnimation(parent: _ac, curve: Curves.easeOut);
-
+class _BootState extends State<_Boot> {
   @override
   void initState() {
     super.initState();
-    Future.microtask(() async {
-      try {
-        await AppStorage.init();
-        await AppState.I.loadAll();
-      } catch (e, st) {
-        debugPrint('Boot error: $e\n$st');
-      } finally {
-        if (!mounted) return;
-        await Future.delayed(const Duration(milliseconds: 400));
-        Navigator.pushReplacementNamed(
-          context,
-          AuthService.uid != null ? '/home' : '/login',
-        );
-      }
-    });
+    _decide();
   }
 
-  @override
-  void dispose() {
-    _ac.dispose();
-    super.dispose();
+  Future<void> _decide() async {
+    await AppStorage.init();
+    await AppState.I.loadAll();
+
+    final seen = await AppStorage.loadOnboardingSeen();
+
+    if (!seen) {
+      // โหลดภาษาที่เคยเลือกไว้ ตรงนี้ใช้ await ได้เพราะอยู่นอก builder
+      final initialLang =
+          await AppStorage.loadAppLanguage(); // 'th' | 'en' | null
+      if (!mounted) return;
+
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(
+          builder: (navCtx) => OnboardingFlow(
+            // ✅ ใช้ตัวแปร ไม่ใช้ await ใน builder
+            initialLang: initialLang,
+            onPickLanguage: (code) => AppStorage.saveAppLanguage(code),
+            onMarkSeen: () => AppStorage.saveOnboardingSeen(true),
+            onFinish: () {
+              // ใช้ navCtx (context ของหน้าบนสุด) แทน context ของ _Boot
+              if (AuthService.uid != null) {
+                Navigator.of(navCtx)
+                    .pushNamedAndRemoveUntil('/home', (r) => false);
+              } else {
+                Navigator.of(navCtx)
+                    .pushNamedAndRemoveUntil('/login', (r) => false);
+              }
+            },
+          ),
+        ),
+      );
+      return;
+    }
+
+    if (AuthService.uid != null) {
+      Navigator.of(context).pushReplacementNamed('/home');
+    } else {
+      Navigator.of(context).pushReplacementNamed('/login');
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    const kLogoFraction =
-        0.62; // สัดส่วนกว้างของโลโก้เทียบกับหน้าจอ (ลด/เพิ่มได้)
-    const kLogoMaxWidth = 420.0; // ไม่ให้เกิน 420px บนอุปกรณ์ใหญ่
-
-    return Scaffold(
-      body: FadeTransition(
-        opacity: _fade,
-        child: LayoutBuilder(
-          builder: (context, cons) {
-            final logoWidth =
-                (cons.maxWidth * kLogoFraction).clamp(0.0, kLogoMaxWidth);
-            return Stack(
-              fit: StackFit.expand,
-              children: [
-                // พื้นหลัง
-                const ColoredBox(color: Colors.white),
-
-                // โลโก้ย่ออัตโนมัติ (ไม่เต็มจอ)
-                Center(
-                  child: ConstrainedBox(
-                    constraints: BoxConstraints(
-                      maxWidth: logoWidth,
-                    ),
-                    child: AspectRatio(
-                      // ถ้ารูปเป็นสี่เหลี่ยมจัตุรัส ตั้ง 1/1; ถ้าเป็นสัดส่วนอื่นเอาออกได้
-                      aspectRatio: 1,
-                      child: FittedBox(
-                        fit: BoxFit.contain,
-                        child: Image.asset(
-                          'assets/hereme.png',
-                          filterQuality: FilterQuality.high,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            );
-          },
-        ),
-      ),
+    return const Scaffold(
+      body: Center(child: CircularProgressIndicator()),
     );
   }
 }
@@ -1127,673 +1177,588 @@ class LoginPage extends StatefulWidget {
   State<LoginPage> createState() => _LoginPageState();
 }
 
-enum AuthMethod { email, phonePass, phoneOtp }
+class _LoginPageState extends State<LoginPage> {
+  // แท็บบนสุด: 0 = เข้าสู่ระบบ, 1 = สมัครสมาชิก
+  int _topTab = 0;
 
-class _LoginPageState extends State<LoginPage>
-    with SingleTickerProviderStateMixin {
-  late final TabController _tab = TabController(length: 2, vsync: this);
+  // วิธี: 0 = Email(OTP), 1 = Phone+Pass
+  int _loginMethodIndex = 0;
+  int _signupMethodIndex = 0;
 
-  // Email login
+  // ----- Controllers (Login) -----
   final _loginEmail = TextEditingController();
-  final _loginPass = TextEditingController();
-
-  // Email sign up
-  final _signupEmail = TextEditingController();
-  final _signupPass = TextEditingController();
-
-  // Phone+Password (login)
   final _loginPhonePass = TextEditingController();
   final _loginPhonePassPwd = TextEditingController();
 
-  // Phone+Password (signup)
+  // ----- Controllers (Signup) -----
+  final _signupEmail = TextEditingController();
   final _signupPhonePass = TextEditingController();
   final _signupPhonePassPwd = TextEditingController();
-  // ใหม่: OTP สำหรับ “สมัครด้วยเบอร์+รหัส”
-  final _otpSignupPass = TextEditingController();
-
-  // Phone OTP (login)
-  final _phoneLogin = TextEditingController();
-  final _otpLogin = TextEditingController();
-
-  // Phone OTP (signup)
-  final _phoneSignup = TextEditingController();
-  final _otpSignup = TextEditingController();
-
-  AuthMethod loginMethod = AuthMethod.email;
-  AuthMethod signupMethod = AuthMethod.email;
 
   bool _busy = false;
-  bool _awaitingOtpLogin = false;
-  bool _awaitingOtpSignup = false;
-  // ใหม่: กำลังรอ OTP ของ flow “สมัครด้วยเบอร์+รหัส”
-  bool _awaitingPhonePassOtp = false;
 
-  void _snack(String msg) =>
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  // ===== Cooldown สำหรับ Email OTP =====
+  final Duration _emailOtpCooldown = const Duration(seconds: 60);
+  DateTime? _lastEmailOtpAt;
 
-  // =========================
-  // Email flows
-  // =========================
-  Future<void> _doEmailLogin() async {
-    final email = _loginEmail.text.trim();
-    final pwd = _loginPass.text.trim();
-    if (email.isEmpty || pwd.isEmpty) {
-      _snack('กรอกอีเมลและรหัสผ่านก่อน');
-      return;
-    }
-    setState(() => _busy = true);
-    try {
-      await AuthService.signInEmail(email, pwd);
-    } on sb.AuthException catch (e) {
-      _snack('เข้าสู่ระบบไม่สำเร็จ: ${e.message}');
-    } catch (e) {
-      _snack('ผิดพลาด: $e');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
+  bool get _isEmailOtpCoolingDown {
+    if (_lastEmailOtpAt == null) return false;
+    return DateTime.now().difference(_lastEmailOtpAt!) < _emailOtpCooldown;
   }
 
-  Future<void> _doEmailSignup() async {
-    final email = _signupEmail.text.trim();
-    final pwd = _signupPass.text.trim();
-    if (email.isEmpty || pwd.isEmpty) {
-      _snack('กรอกอีเมลและรหัสผ่านก่อน');
-      return;
-    }
-    setState(() => _busy = true);
-    try {
-      await AuthService.signUpEmail(email, pwd);
-      _snack('สมัครสำเร็จ! กรุณายืนยันอีเมล (ถ้าตั้งค่าให้ต้องยืนยัน)');
-    } on sb.AuthException catch (e) {
-      _snack('สมัครสมาชิกไม่สำเร็จ: ${e.message}');
-    } catch (e) {
-      _snack('ผิดพลาด: $e');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
+  int get _emailOtpRemainSecs {
+    if (_lastEmailOtpAt == null) return 0;
+    final left =
+        _emailOtpCooldown - DateTime.now().difference(_lastEmailOtpAt!);
+    return left.isNegative ? 0 : left.inSeconds;
   }
 
-  // =========================
-  // Phone + Password flows
-  // =========================
-  Future<void> _doPhonePassLogin() async {
-    final phone = _loginPhonePass.text.trim();
-    final pwd = _loginPhonePassPwd.text.trim();
-    if (phone.isEmpty || pwd.isEmpty) {
-      _snack('กรอกเบอร์และรหัสผ่านก่อน');
-      return;
-    }
-    setState(() => _busy = true);
-    try {
-      await AuthService.signInPhoneWithPassword(phone, pwd);
-    } on sb.AuthException catch (e) {
-      _snack('เข้าสู่ระบบไม่สำเร็จ: ${e.message}');
-    } catch (e) {
-      _snack('ผิดพลาด: $e');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
+  @override
+  void dispose() {
+    _loginEmail.dispose();
+    _loginPhonePass.dispose();
+    _loginPhonePassPwd.dispose();
+    _signupEmail.dispose();
+    _signupPhonePass.dispose();
+    _signupPhonePassPwd.dispose();
+    super.dispose();
   }
 
-  /// สมัคร “เบอร์ + รหัส” แล้วให้ระบบส่ง OTP ไปที่เบอร์
-  Future<void> _doPhonePassSignup() async {
-    final phone = _signupPhonePass.text.trim();
-    final pwd = _signupPhonePassPwd.text.trim();
-    if (phone.isEmpty || pwd.isEmpty) {
-      _snack('กรอกเบอร์และรหัสผ่านก่อน');
-      return;
-    }
-
-    setState(() => _busy = true);
-    try {
-      // 1) สร้าง user พร้อม password
-      await AuthService.signUpPhoneWithPassword(phone, pwd);
-      // 2) ส่ง OTP เพื่อยืนยันเบอร์
-      setState(() => _awaitingPhonePassOtp = true);
-      _snack(
-          'สมัครสำเร็จ! ส่ง OTP ไปทาง SMS แล้ว กรุณากรอกรหัส 6 หลักเพื่อยืนยันเบอร์');
-    } on sb.AuthException catch (e) {
-      _snack('สมัครสมาชิกไม่สำเร็จ: ${e.message}');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
-  /// ยืนยัน OTP หลังสมัครด้วยเบอร์+รหัส  ✅ ส่ง password ไปบันทึกใน phone_users
-  Future<void> _verifyPhonePassSignupOtp() async {
-    final phone = _signupPhonePass.text.trim();
-    final code = _otpSignupPass.text.trim();
-    final pwd = _signupPhonePassPwd.text.trim();
-    if (phone.isEmpty || code.isEmpty) {
-      _snack('กรอกเบอร์และรหัส 6 หลักก่อน');
-      return;
-    }
+  // ------------------ EMAIL OTP SHEET (มีปุ่มส่งรหัสใหม่ + นับถอยหลัง) ------------------
+  Future<void> _showEmailOtpSheet({required String email}) async {
+    final codeCtrl = TextEditingController();
+    Timer? ticker;
 
-    setState(() => _busy = true);
-    try {
-      await AuthService.verifyPhonePassSignup(
-        phoneRaw: phone,
-        code6: code,
-        password: pwd, // <-- สำคัญ
-      );
-      _snack('ยืนยันเบอร์สำเร็จ! ตอนนี้ล็อกอินด้วย “เบอร์ + รหัส” ได้แล้ว');
-      setState(() => _awaitingPhonePassOtp = false);
-    } on sb.AuthException catch (e) {
-      _snack('รหัสไม่ถูกต้อง: ${e.message}');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        final bottom = MediaQuery.of(ctx).viewInsets.bottom;
+
+        return StatefulBuilder(
+          builder: (ctx, setModal) {
+            // สร้าง timer ครั้งเดียว เอาไว้รีเฟรชข้อความนับถอยหลัง
+            ticker ??= Timer.periodic(const Duration(seconds: 1), (_) {
+              if (!Navigator.of(ctx).canPop()) return;
+              setModal(() {}); // รีเฟรชปุ่ม resend ทุก 1 วิ
+            });
+
+            final canResend = !_isEmailOtpCoolingDown;
+
+            return Padding(
+              padding: EdgeInsets.fromLTRB(20, 16, 20, bottom + 20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 40,
+                    height: 4,
+                    margin: const EdgeInsets.only(bottom: 12),
+                    decoration: BoxDecoration(
+                      color: Colors.black12,
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                  ),
+                  Text('ยืนยันรหัส OTP (อีเมล)',
+                      style: Theme.of(ctx).textTheme.titleMedium),
+                  const SizedBox(height: 8),
+                  Text('เราได้ส่งรหัส 6 หลักไปที่\n$email',
+                      textAlign: TextAlign.center,
+                      style: Theme.of(ctx).textTheme.bodySmall),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: codeCtrl,
+                    maxLength: 6,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(
+                      hintText: 'กรอกรหัส 6 หลัก',
+                      counterText: '',
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton(
+                      onPressed: () async {
+                        try {
+                          await AuthService.verifyEmailOtp(
+                            email: email,
+                            code6: codeCtrl.text.trim(),
+                          );
+                          if (!mounted) return;
+                          Navigator.of(ctx).pop();
+                          Navigator.of(context)
+                              .pushNamedAndRemoveUntil('/home', (r) => false);
+                        } catch (e) {
+                          _snack(e.toString());
+                        }
+                      },
+                      child: const Text('ยืนยัน'),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextButton(
+                    onPressed: canResend
+                        ? () async {
+                            try {
+                              await AuthService.sendOtpToEmail(
+                                email,
+                                shouldCreateUser: true,
+                              );
+                              _lastEmailOtpAt = DateTime.now();
+                              setModal(() {});
+                              _snack('ส่งรหัสใหม่แล้ว ตรวจอีเมลได้เลย');
+                            } catch (e) {
+                              _snack(e.toString());
+                              // ถ้าโดน 429 ก็ถือว่าเริ่มคูลดาวน์เช่นกัน
+                              _lastEmailOtpAt ??= DateTime.now();
+                              setModal(() {});
+                            }
+                          }
+                        : null,
+                    child: Text(canResend
+                        ? 'ส่งรหัสใหม่'
+                        : 'ส่งใหม่ใน $_emailOtpRemainSecs วินาที'),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+
+    // ปิดแผ่นแล้วหยุด timer
+    ticker?.cancel();
   }
 
-  // =========================
-  // Phone OTP (ล้วน)
-  // =========================
-  Future<void> _sendLoginOtp() async {
-    final phone = _phoneLogin.text.trim();
-    if (phone.isEmpty) {
-      _snack('กรอกเบอร์โทรก่อน');
-      return;
-    }
-    setState(() => _busy = true);
-    try {
-      await AuthService.sendOtpToPhone(phone);
-      setState(() => _awaitingOtpLogin = true);
-      _snack('ส่งรหัส 6 หลักทาง SMS แล้ว');
-    } on sb.AuthException catch (e) {
-      _snack('ส่งรหัสไม่สำเร็จ: ${e.message}');
-    } catch (e) {
-      _snack('ผิดพลาด: $e');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _verifyLoginOtp() async {
-    final phone = _phoneLogin.text.trim();
-    final code = _otpLogin.text.trim();
-    if (phone.isEmpty || code.isEmpty) {
-      _snack('กรอกเบอร์และรหัส 6 หลักก่อน');
-      return;
-    }
-    setState(() => _busy = true);
-    try {
-      await AuthService.verifyPhoneOtp(phoneRaw: phone, code6: code);
-    } on sb.AuthException catch (e) {
-      _snack('รหัสไม่ถูกต้อง: ${e.message}');
-    } catch (e) {
-      _snack('ผิดพลาด: $e');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _sendSignupOtp() async {
-    final phone = _phoneSignup.text.trim();
-    if (phone.isEmpty) {
-      _snack('กรอกเบอร์โทรก่อน');
-      return;
-    }
-    setState(() => _busy = true);
-    try {
-      await AuthService.sendOtpToPhone(phone);
-      setState(() => _awaitingOtpSignup = true);
-      _snack('ส่งรหัส 6 หลักทาง SMS แล้ว');
-    } on sb.AuthException catch (e) {
-      _snack('ส่งรหัสไม่สำเร็จ: ${e.message}');
-    } catch (e) {
-      _snack('ผิดพลาด: $e');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _verifySignupOtp() async {
-    final phone = _phoneSignup.text.trim();
-    final code = _otpSignup.text.trim();
-    if (phone.isEmpty || code.isEmpty) {
-      _snack('กรอกเบอร์และรหัส 6 หลักก่อน');
-      return;
-    }
-    setState(() => _busy = true);
-    try {
-      await AuthService.verifyPhoneOtp(phoneRaw: phone, code6: code);
-      _snack('ยืนยันเบอร์สำเร็จ!');
-    } on sb.AuthException catch (e) {
-      _snack('รหัสไม่ถูกต้อง: ${e.message}');
-    } catch (e) {
-      _snack('ผิดพลาด: $e');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  // =========================
-  // OAuth
-  // =========================
-  Future<void> _doOAuth(sb.OAuthProvider p) async {
-    setState(() => _busy = true);
-    try {
-      await AuthService.signInOAuth(p);
-    } on sb.AuthException catch (e) {
-      _snack('OAuth ล้มเหลว: ${e.message}');
-    } catch (e) {
-      _snack('ผิดพลาด: $e');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  // ปุ่ม OAuth ขนาดเท่ากัน
-  Widget _oauthButton({
-    required IconData icon,
-    required String label,
-    Color? bg,
-    Color? fg,
-    VoidCallback? onPressed,
-    BorderSide? side,
+  // ------------------ PHONE OTP SHEET (ของเดิม) ------------------
+  void _showPhoneOtpVerifySheet({
+    required String phone,
+    required String password,
   }) {
-    return SizedBox(
-      width: double.infinity,
-      child: FilledButton.icon(
-        onPressed: _busy ? null : onPressed,
-        icon: Icon(icon),
-        label: Text(label),
-        style: FilledButton.styleFrom(
-          minimumSize: const Size.fromHeight(48),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
+    final codeCtrl = TextEditingController();
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        final bottom = MediaQuery.of(ctx).viewInsets.bottom;
+        return Padding(
+          padding: EdgeInsets.fromLTRB(20, 16, 20, bottom + 20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 40,
+                height: 4,
+                margin: const EdgeInsets.only(bottom: 12),
+                decoration: BoxDecoration(
+                  color: Colors.black12,
+                  borderRadius: BorderRadius.circular(999),
+                ),
+              ),
+              Text('ยืนยันรหัส OTP (เบอร์)',
+                  style: Theme.of(ctx).textTheme.titleMedium),
+              const SizedBox(height: 12),
+              TextField(
+                controller: codeCtrl,
+                maxLength: 6,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  hintText: 'กรอกรหัส 6 หลัก',
+                  counterText: '',
+                ),
+              ),
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton(
+                  onPressed: () async {
+                    try {
+                      await AuthService.verifyPhonePassSignup(
+                        phoneRaw: phone,
+                        code6: codeCtrl.text.trim(),
+                        password: password,
+                      );
+                      if (!mounted) return;
+                      Navigator.of(ctx).pop();
+                      _snack('ยืนยันสำเร็จ! เข้าสู่ระบบให้แล้ว');
+                      Navigator.of(context)
+                          .pushNamedAndRemoveUntil('/home', (r) => false);
+                    } catch (e) {
+                      _snack(e.toString());
+                    }
+                  },
+                  child: const Text('ยืนยัน'),
+                ),
+              ),
+            ],
           ),
-          backgroundColor: bg,
-          foregroundColor: fg,
-          side: side,
+        );
+      },
+    );
+  }
+
+  // ------------------ ACTIONS ------------------
+
+  Future<void> _onTapLogin() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      if (_loginMethodIndex == 0) {
+        // Email OTP
+        final email = _loginEmail.text.trim();
+        if (email.isEmpty) throw 'กรอกอีเมลก่อน';
+
+        if (_isEmailOtpCoolingDown) {
+          _snack('ขอส่งรหัสใหม่ได้ในอีก $_emailOtpRemainSecs วินาที');
+          return;
+        }
+
+        await AuthService.sendOtpToEmail(email, shouldCreateUser: true);
+        _lastEmailOtpAt = DateTime.now();
+        await _showEmailOtpSheet(email: email);
+      } else {
+        // Phone + Password
+        await AuthService.signInPhoneWithPassword(
+          _loginPhonePass.text.trim(),
+          _loginPhonePassPwd.text,
+        );
+        if (!mounted) return;
+        Navigator.of(context).pushNamedAndRemoveUntil('/home', (r) => false);
+      }
+    } catch (e) {
+      _snack(e.toString());
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _onTapSignup() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      if (_signupMethodIndex == 0) {
+        // Signup ด้วย Email OTP
+        final email = _signupEmail.text.trim();
+        if (email.isEmpty) throw 'กรอกอีเมลก่อน';
+
+        if (_isEmailOtpCoolingDown) {
+          _snack('ขอส่งรหัสใหม่ได้ในอีก $_emailOtpRemainSecs วินาที');
+          return;
+        }
+
+        await AuthService.sendOtpToEmail(email, shouldCreateUser: true);
+        _lastEmailOtpAt = DateTime.now();
+        await _showEmailOtpSheet(email: email);
+      } else {
+        // Signup ด้วย เบอร์ + รหัส (OTP ที่เบอร์)
+        final phone = _signupPhonePass.text.trim();
+        final pwd = _signupPhonePassPwd.text;
+        await AuthService.startPhonePassSignup(
+          phoneRaw: phone,
+          password: pwd,
+        );
+        _showPhoneOtpVerifySheet(phone: phone, password: pwd);
+      }
+    } catch (e) {
+      _snack(e.toString());
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  // ------------------ UI HELPERS ------------------
+
+  Widget _seg2({
+    required int value,
+    required String leftLabel,
+    required String rightLabel,
+    required void Function(int) onChanged,
+  }) {
+    return Row(
+      children: [
+        Expanded(
+          child: _SegBtn(
+            label: leftLabel,
+            selected: value == 0,
+            onTap: () => onChanged(0),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: _SegBtn(
+            label: rightLabel,
+            selected: value == 1,
+            onTap: () => onChanged(1),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildLoginForm() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('เลือกรูปแบบเข้าสู่ระบบ',
+            style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w700,
+                )),
+        const SizedBox(height: 8),
+        _seg2(
+          value: _loginMethodIndex,
+          leftLabel: 'อีเมล (OTP)',
+          rightLabel: 'เบอร์ + รหัส',
+          onChanged: (v) => setState(() => _loginMethodIndex = v),
+        ),
+        const SizedBox(height: 12),
+        if (_loginMethodIndex == 0) ...[
+          TextField(
+            controller: _loginEmail,
+            keyboardType: TextInputType.emailAddress,
+            decoration: const InputDecoration(hintText: 'อีเมล'),
+          ),
+        ] else ...[
+          TextField(
+            controller: _loginPhonePass,
+            keyboardType: TextInputType.phone,
+            decoration:
+                const InputDecoration(hintText: 'เบอร์โทร (0 หรือ +66 ก็ได้)'),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _loginPhonePassPwd,
+            obscureText: true,
+            decoration: const InputDecoration(hintText: 'รหัสผ่าน'),
+          ),
+        ],
+        const SizedBox(height: 16),
+        SizedBox(
+          width: double.infinity,
+          child: FilledButton(
+            onPressed: _busy ? null : _onTapLogin,
+            child: _busy
+                ? const SizedBox(
+                    height: 18, width: 18, child: CircularProgressIndicator())
+                : const Text('เข้าสู่ระบบ'),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildSignupForm() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('เลือกรูปแบบสมัครสมาชิก',
+            style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w700,
+                )),
+        const SizedBox(height: 8),
+        _seg2(
+          value: _signupMethodIndex,
+          leftLabel: 'อีเมล (OTP)',
+          rightLabel: 'เบอร์ + รหัส',
+          onChanged: (v) => setState(() => _signupMethodIndex = v),
+        ),
+        const SizedBox(height: 12),
+        if (_signupMethodIndex == 0) ...[
+          TextField(
+            controller: _signupEmail,
+            keyboardType: TextInputType.emailAddress,
+            decoration: const InputDecoration(hintText: 'อีเมล'),
+          ),
+        ] else ...[
+          TextField(
+            controller: _signupPhonePass,
+            keyboardType: TextInputType.phone,
+            decoration:
+                const InputDecoration(hintText: 'เบอร์โทร (0 หรือ +66 ก็ได้)'),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _signupPhonePassPwd,
+            obscureText: true,
+            decoration: const InputDecoration(hintText: 'ตั้งรหัสผ่าน'),
+          ),
+        ],
+        const SizedBox(height: 16),
+        SizedBox(
+          width: double.infinity,
+          child: FilledButton(
+            onPressed: _busy ? null : _onTapSignup,
+            child: _busy
+                ? const SizedBox(
+                    height: 18, width: 18, child: CircularProgressIndicator())
+                : const Text('สมัครสมาชิก'),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ------------------ BUILD ------------------
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Scaffold(
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+          children: [
+            const SizedBox(height: 8),
+
+            // ===== โลโก้ + HereMe จัดกลาง =====
+            Center(
+              child: Column(
+                children: [
+                  Container(
+                    width: 72,
+                    height: 72,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFE7F6F0),
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                    child:
+                        Icon(Icons.favorite, color: theme.colorScheme.primary),
+                  ),
+                  const SizedBox(height: 12),
+                  Text('HereMe',
+                      textAlign: TextAlign.center,
+                      style: theme.textTheme.headlineMedium
+                          ?.copyWith(fontWeight: FontWeight.w800)),
+                ],
+              ),
+            ),
+
+            const SizedBox(height: 16),
+
+            // แท็บบนสุด
+            Row(
+              children: [
+                Expanded(
+                  child: _TopTab(
+                    label: 'เข้าสู่ระบบ',
+                    selected: _topTab == 0,
+                    onTap: () => setState(() => _topTab = 0),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: _TopTab(
+                    label: 'สมัครสมาชิก',
+                    selected: _topTab == 1,
+                    onTap: () => setState(() => _topTab = 1),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+
+            if (_topTab == 0) _buildLoginForm() else _buildSignupForm(),
+
+            const SizedBox(height: 24),
+            Center(
+              child: TextButton(
+                onPressed: () {
+                  // TODO: forgot password
+                },
+                child: Text('ลืมรหัสผ่าน (Forgot?)',
+                    style: TextStyle(color: theme.colorScheme.primary)),
+              ),
+            ),
+          ],
         ),
       ),
     );
   }
+}
 
+// ========================== Small UI widgets ==========================
+
+class _TopTab extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+  const _TopTab(
+      {required this.label, required this.selected, required this.onTap});
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Scaffold(
-      body: SafeArea(
-        child: LayoutBuilder(
-          builder: (context, cons) {
-            return SingleChildScrollView(
-              padding: EdgeInsets.fromLTRB(
-                16,
-                16,
-                16,
-                16 + MediaQuery.of(context).viewInsets.bottom,
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(14),
+      child: Container(
+        height: 44,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: selected ? const Color(0xFFE7F6F0) : const Color(0xFFF4F6F5),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontWeight: FontWeight.w700,
+            color: selected
+                ? Theme.of(context).colorScheme.primary
+                : Colors.black87,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SegBtn extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+  const _SegBtn(
+      {required this.label, required this.selected, required this.onTap});
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        height: 44,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: selected ? const Color(0xFFE7F6F0) : Colors.white,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: const Color(0xFFDEDEDE)),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            if (selected) ...[
+              Icon(Icons.check,
+                  size: 16, color: Theme.of(context).colorScheme.primary),
+              const SizedBox(width: 6),
+            ],
+            Text(
+              label,
+              style: TextStyle(
+                fontWeight: FontWeight.w600,
+                color: selected
+                    ? Theme.of(context).colorScheme.primary
+                    : Colors.black87,
               ),
-              child: ConstrainedBox(
-                constraints: BoxConstraints(minHeight: cons.maxHeight),
-                child: Column(
-                  children: [
-                    const SizedBox(height: 6),
-                    Container(
-                      width: 68,
-                      height: 68,
-                      decoration: BoxDecoration(
-                        color: cs.primary.withOpacity(.12),
-                        borderRadius: BorderRadius.circular(18),
-                      ),
-                      child: const Icon(Icons.favorite, size: 36),
-                    ),
-                    const SizedBox(height: 10),
-                    const Text(
-                      'HereMe',
-                      style: TextStyle(
-                        fontSize: 28,
-                        fontWeight: FontWeight.w900,
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-
-                    // Tabs
-                    Container(
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFF0F7F3),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: TabBar(
-                        controller: _tab,
-                        dividerColor: Colors.transparent,
-                        labelColor: Colors.black,
-                        unselectedLabelColor: Colors.black54,
-                        tabs: const [
-                          Tab(text: 'เข้าสู่ระบบ'),
-                          Tab(text: 'สมัครสมาชิก'),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-
-                    // ใช้ ListView ภายในแต่ละแท็บเพื่อกัน overflow
-                    SizedBox(
-                      height: 500,
-                      child: TabBarView(
-                        controller: _tab,
-                        children: [
-                          // --------------- LOGIN TAB ---------------
-                          ListView(
-                            padding: EdgeInsets.zero,
-                            children: [
-                              const Text(
-                                'เลือกรูปแบบเข้าสู่ระบบ',
-                                style: TextStyle(fontWeight: FontWeight.bold),
-                              ),
-                              const SizedBox(height: 8),
-                              SegmentedButton<AuthMethod>(
-                                segments: const [
-                                  ButtonSegment(
-                                    value: AuthMethod.email,
-                                    label: Text('อีเมล'),
-                                  ),
-                                  ButtonSegment(
-                                    value: AuthMethod.phonePass,
-                                    label: Text('เบอร์ + รหัส'),
-                                  ),
-                                  ButtonSegment(
-                                    value: AuthMethod.phoneOtp,
-                                    label: Text('เบอร์ (OTP)'),
-                                  ),
-                                ],
-                                selected: {loginMethod},
-                                onSelectionChanged: (s) =>
-                                    setState(() => loginMethod = s.first),
-                              ),
-                              const SizedBox(height: 12),
-                              if (loginMethod == AuthMethod.email) ...[
-                                TextField(
-                                  controller: _loginEmail,
-                                  keyboardType: TextInputType.emailAddress,
-                                  decoration: const InputDecoration(
-                                    labelText: 'Email',
-                                  ),
-                                ),
-                                const SizedBox(height: 10),
-                                TextField(
-                                  controller: _loginPass,
-                                  obscureText: true,
-                                  decoration: const InputDecoration(
-                                    labelText: 'Password',
-                                  ),
-                                ),
-                                const SizedBox(height: 14),
-                                SizedBox(
-                                  width: double.infinity,
-                                  child: FilledButton(
-                                    onPressed: _busy ? null : _doEmailLogin,
-                                    child: const Text('เข้าสู่ระบบ'),
-                                  ),
-                                ),
-                              ] else if (loginMethod ==
-                                  AuthMethod.phonePass) ...[
-                                TextField(
-                                  controller: _loginPhonePass,
-                                  keyboardType: TextInputType.phone,
-                                  decoration: const InputDecoration(
-                                    labelText: 'เบอร์โทร (0 หรือ +66 ก็ได้)',
-                                  ),
-                                ),
-                                const SizedBox(height: 10),
-                                TextField(
-                                  controller: _loginPhonePassPwd,
-                                  obscureText: true,
-                                  decoration: const InputDecoration(
-                                    labelText: 'รหัสผ่าน',
-                                  ),
-                                ),
-                                const SizedBox(height: 14),
-                                SizedBox(
-                                  width: double.infinity,
-                                  child: FilledButton(
-                                    onPressed: _busy ? null : _doPhonePassLogin,
-                                    child: const Text('เข้าสู่ระบบ'),
-                                  ),
-                                ),
-                              ] else ...[
-                                TextField(
-                                  controller: _phoneLogin,
-                                  keyboardType: TextInputType.phone,
-                                  decoration: const InputDecoration(
-                                    labelText: 'เบอร์โทร (0 หรือ +66 ก็ได้)',
-                                  ),
-                                ),
-                                const SizedBox(height: 10),
-                                if (_awaitingOtpLogin)
-                                  TextField(
-                                    controller: _otpLogin,
-                                    keyboardType: TextInputType.number,
-                                    decoration: const InputDecoration(
-                                      labelText: 'รหัส 6 หลัก',
-                                    ),
-                                  ),
-                                const SizedBox(height: 14),
-                                Row(
-                                  children: [
-                                    Expanded(
-                                      child: OutlinedButton(
-                                        onPressed: _busy ? null : _sendLoginOtp,
-                                        child: const Text('ส่งรหัส'),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Expanded(
-                                      child: FilledButton(
-                                        onPressed: (_busy || !_awaitingOtpLogin)
-                                            ? null
-                                            : _verifyLoginOtp,
-                                        child: const Text('ยืนยันรหัส'),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ],
-                              const SizedBox(height: 16),
-                              _oauthButton(
-                                icon: Icons.apple,
-                                label: 'Sign in with Apple',
-                                bg: Colors.black,
-                                fg: Colors.white,
-                                onPressed: () =>
-                                    _doOAuth(sb.OAuthProvider.apple),
-                              ),
-                              const SizedBox(height: 8),
-                              _oauthButton(
-                                icon: Icons.facebook,
-                                label: 'Sign in with Facebook',
-                                bg: const Color(0xFF1877F2),
-                                fg: Colors.white,
-                                onPressed: () =>
-                                    _doOAuth(sb.OAuthProvider.facebook),
-                              ),
-                              const SizedBox(height: 8),
-                              _oauthButton(
-                                icon: Icons.g_mobiledata,
-                                label: 'Sign in with Google',
-                                bg: Colors.white,
-                                fg: Colors.black87,
-                                side: const BorderSide(color: Colors.black12),
-                                onPressed: () =>
-                                    _doOAuth(sb.OAuthProvider.google),
-                              ),
-                            ],
-                          ),
-
-                          // --------------- SIGN UP TAB ---------------
-                          ListView(
-                            padding: EdgeInsets.zero,
-                            children: [
-                              const Text(
-                                'เลือกรูปแบบสมัครสมาชิก',
-                                style: TextStyle(fontWeight: FontWeight.bold),
-                              ),
-                              const SizedBox(height: 8),
-                              SegmentedButton<AuthMethod>(
-                                segments: const [
-                                  ButtonSegment(
-                                    value: AuthMethod.email,
-                                    label: Text('อีเมล'),
-                                  ),
-                                  ButtonSegment(
-                                    value: AuthMethod.phonePass,
-                                    label: Text('เบอร์ + รหัส'),
-                                  ),
-                                  ButtonSegment(
-                                    value: AuthMethod.phoneOtp,
-                                    label: Text('เบอร์ (OTP)'),
-                                  ),
-                                ],
-                                selected: {signupMethod},
-                                onSelectionChanged: (s) =>
-                                    setState(() => signupMethod = s.first),
-                              ),
-                              const SizedBox(height: 12),
-                              if (signupMethod == AuthMethod.email) ...[
-                                TextField(
-                                  controller: _signupEmail,
-                                  keyboardType: TextInputType.emailAddress,
-                                  decoration: const InputDecoration(
-                                    labelText: 'Email',
-                                  ),
-                                ),
-                                const SizedBox(height: 10),
-                                TextField(
-                                  controller: _signupPass,
-                                  obscureText: true,
-                                  decoration: const InputDecoration(
-                                    labelText: 'Password (min 6)',
-                                  ),
-                                ),
-                                const SizedBox(height: 14),
-                                SizedBox(
-                                  width: double.infinity,
-                                  child: FilledButton(
-                                    onPressed: _busy ? null : _doEmailSignup,
-                                    child: const Text('สมัครสมาชิก'),
-                                  ),
-                                ),
-                              ] else if (signupMethod ==
-                                  AuthMethod.phonePass) ...[
-                                TextField(
-                                  controller: _signupPhonePass,
-                                  keyboardType: TextInputType.phone,
-                                  decoration: const InputDecoration(
-                                    labelText: 'เบอร์โทร (0 หรือ +66 ก็ได้)',
-                                  ),
-                                ),
-                                const SizedBox(height: 10),
-                                TextField(
-                                  controller: _signupPhonePassPwd,
-                                  obscureText: true,
-                                  decoration: const InputDecoration(
-                                    labelText: 'รหัสผ่าน (อย่างน้อย 6 ตัว)',
-                                  ),
-                                ),
-                                const SizedBox(height: 14),
-                                SizedBox(
-                                  width: double.infinity,
-                                  child: FilledButton(
-                                    onPressed:
-                                        _busy ? null : _doPhonePassSignup,
-                                    child: const Text('สมัครสมาชิก'),
-                                  ),
-                                ),
-
-                                // แสดงช่องกรอก OTP เมื่อระบบส่งรหัสแล้ว
-                                if (_awaitingPhonePassOtp) ...[
-                                  const SizedBox(height: 12),
-                                  TextField(
-                                    controller: _otpSignupPass,
-                                    keyboardType: TextInputType.number,
-                                    decoration: const InputDecoration(
-                                      labelText: 'รหัส 6 หลัก (OTP)',
-                                    ),
-                                  ),
-                                  const SizedBox(height: 12),
-                                  SizedBox(
-                                    width: double.infinity,
-                                    child: FilledButton(
-                                      onPressed: _busy
-                                          ? null
-                                          : _verifyPhonePassSignupOtp,
-                                      child: const Text('ยืนยัน OTP'),
-                                    ),
-                                  ),
-                                ],
-                              ] else ...[
-                                TextField(
-                                  controller: _phoneSignup,
-                                  keyboardType: TextInputType.phone,
-                                  decoration: const InputDecoration(
-                                    labelText: 'เบอร์โทร (0 หรือ +66 ก็ได้)',
-                                  ),
-                                ),
-                                const SizedBox(height: 10),
-                                if (_awaitingOtpSignup)
-                                  TextField(
-                                    controller: _otpSignup,
-                                    keyboardType: TextInputType.number,
-                                    decoration: const InputDecoration(
-                                      labelText: 'รหัส 6 หลัก',
-                                    ),
-                                  ),
-                                const SizedBox(height: 14),
-                                Row(
-                                  children: [
-                                    Expanded(
-                                      child: OutlinedButton(
-                                        onPressed:
-                                            _busy ? null : _sendSignupOtp,
-                                        child: const Text('ส่งรหัส'),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Expanded(
-                                      child: FilledButton(
-                                        onPressed:
-                                            (_busy || !_awaitingOtpSignup)
-                                                ? null
-                                                : _verifySignupOtp,
-                                        child: const Text('ยืนยันรหัส'),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ],
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-
-                    const SizedBox(height: 8),
-                    TextButton(
-                      onPressed: _busy
-                          ? null
-                          : () async {
-                              if (_loginEmail.text.trim().isEmpty) {
-                                _snack('กรอกอีเมลในฟอร์มเข้าสู่ระบบก่อน');
-                                return;
-                              }
-                              try {
-                                await supabase.auth.resetPasswordForEmail(
-                                  _loginEmail.text.trim(),
-                                  redirectTo: 'hereme://login-callback',
-                                );
-                                _snack('ส่งลิงก์รีเซ็ตรหัสผ่านแล้ว');
-                              } catch (e) {
-                                _snack('ส่งลิงก์ไม่สำเร็จ: $e');
-                              }
-                            },
-                      child: const Text('ลืมรหัสผ่าน (Forgot?)'),
-                    ),
-                  ],
-                ),
-              ),
-            );
-          },
+            ),
+          ],
         ),
       ),
     );
